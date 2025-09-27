@@ -68,7 +68,6 @@ def make_payload_extractor(cfg: Dict[str, Any]) -> Callable[[str], str]:
                 return s
             return _rx
         except Exception:
-            # fall through to mode/heuristic if regex is bad
             pass
 
     if mode == "after_last_pipe":
@@ -173,7 +172,7 @@ class AppCore:
         self.style.configure("Accent.TButton",
                              background=p["accent"], foreground=p["accent_fg"],
                              font=("Segoe UI", 10, "bold"), padding=8)
-        self.style.map("Accent.TButton", background=[("active", p["accent"])])
+        self.style.map("Accent.TButton", background=[("active", p["accent"]])]
         self.style.configure("Color.Horizontal.TProgressbar",
                              troughcolor=p["card"], background=p["progress"])
 
@@ -187,7 +186,7 @@ class AppCore:
                   command=lambda: messagebox.showinfo(
                       "Help",
                       f"{self.APP_NAME} {self.APP_VERSION}\n\n"
-                      "Offline: compare Logs vs Test cases, see per-step progress, export HTML/CSV/JSON.\n"
+                      "Offline: compare Logs vs Test cases, see per-step progress, export HTML reports.\n"
                       "Online: live DLT with HMI preview (Android), per-step progress.\n\n"
                       "Settings live in Code/TRE_config.json.\n"
                       "Line payload display can be controlled via payload_regex or payload_mode.\n"
@@ -276,7 +275,7 @@ class AppCore:
         btnsL.grid(row=2, column=0, sticky="w", pady=(6,12), columnspan=2)
         ttk.Button(btnsL, text="Add…",
                    command=lambda: self.add_files(self.lst_logs, self.off_logs,
-                                                  [("Logs","*.log *.txt *.csv"), ("All","*.*")],
+                                                  [("Logs","*.log *.txt"), ("All","*.*")],
                                                   "Select logs", LOGS_DIR)).grid(row=0, column=0, padx=4)
         ttk.Button(btnsL, text="Remove",
                    command=lambda: self.remove_selected(self.lst_logs, self.off_logs)).grid(row=0, column=1, padx=4)
@@ -321,17 +320,13 @@ class AppCore:
         self.off_ent_prev.insert(0, "0")
         self.off_ent_prev.grid(row=3, column=4, sticky="w")
 
-        # Output toggles
+        # Output toggles (HTML only)
         self.off_var_html = tk.BooleanVar(value=True)
-        self.off_var_json = tk.BooleanVar(value=False)
-        self.off_var_csv  = tk.BooleanVar(value=False)
         self.off_var_open = tk.BooleanVar(value=True)
         tog = ttk.Frame(off_tab)
         tog.grid(row=4, column=3, columnspan=3, sticky="w")
         ttk.Checkbutton(tog, text="Generate HTML", variable=self.off_var_html).grid(row=0, column=0, padx=(0,16))
-        ttk.Checkbutton(tog, text="Generate JSON", variable=self.off_var_json).grid(row=0, column=1, padx=(0,16))
-        ttk.Checkbutton(tog, text="Generate CSV",  variable=self.off_var_csv ).grid(row=0, column=2, padx=(0,16))
-        ttk.Checkbutton(tog, text="Open first HTML after run", variable=self.off_var_open).grid(row=0, column=3, padx=(0,16))
+        ttk.Checkbutton(tog, text="Open first HTML after run", variable=self.off_var_open).grid(row=0, column=1, padx=(0,16))
 
         # Progress label (colored via tk.Label, not ttk)
         tk.Label(off_tab, text="Execution progress (per step)",
@@ -406,7 +401,7 @@ class AppCore:
         # Live per-step (quick pass using TRE_json helpers)
         for idx, t in enumerate(tests, start=1):
             name = t.get("name","unnamed")
-            vc = (t.get("find",{}).get("pattern","") if "find" in t else
+            vc = (t.get("find",{})\n.get("pattern","") if "find" in t else
                   t.get("not_find",{}).get("pattern","") if "not_find" in t else
                   " -> ".join([(e if isinstance(e,str) else e.get("pattern",""))
                                for e in t.get("sequence",[])]) if "sequence" in t else
@@ -432,7 +427,7 @@ class AppCore:
             if self.stop_event_off.is_set():
                 break
 
-        # Final report (HTML/JSON/CSV)
+        # Final report (HTML only)
         rpt = tre.run_checks(log_path, test_path)
         tre.adjust_line_numbers(rpt, 0)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -441,8 +436,6 @@ class AppCore:
         teststem = os.path.splitext(testname)[0]
         base = teststem
         html_name = f"{base}_{logstem}_{'LATEST'}.html"
-        json_name = f"{base}_{logstem}_{'LATEST'}.json"
-        csv_name  = f"{base}_{logstem}_{'LATEST'}.csv"
 
         gen = []
         first_html = None
@@ -452,15 +445,6 @@ class AppCore:
                         title=f"{testname} · {logstem}",
                         generator_info=f"{self.APP_NAME} {self.APP_VERSION} — {self.AUTHOR_NAME} <{self.AUTHOR_EMAIL}>")
             gen.append(p); first_html = first_html or p
-        if self.off_var_json.get():
-            p = os.path.join(out_dir, json_name)
-            with open(p, "w", encoding="utf-8") as f:
-                json.dump(rpt, f, indent=2, ensure_ascii=False)
-            gen.append(p)
-        if self.off_var_csv.get():
-            p = os.path.join(out_dir, csv_name)
-            tre.to_csv(rpt, p, log_name=os.path.basename(log_path), test_name=testname)
-            gen.append(p)
 
         return rpt, gen, first_html
 
