@@ -188,6 +188,23 @@ def _extract_payload_heuristic(line: str) -> str:
                 break
     return s
 
+def sanitize_payload(payload: str) -> str:
+        if not payload:
+            return ""
+        s = payload.replace("\r", " ").replace("\n", " ")
+        s = "".join(ch for ch in s if (32 <= ord(ch) <= 126) or ch in "\t ")
+        for tok in {"TELETELE", "AOTA", "CCU2s", "CCU2c"}:
+            s = s.replace(tok, " ")
+        s = _re.sub(r"\b([A-Z]{3,10})(?:\1)+\b", r"\1", s)          # OTAOTA -> OTA
+        s = _re.sub(r"=\s*[A-Z]{2,10}\d*[a-z]?\b", " ", s)          # strip '=CCU2x'
+        s = _re.sub(r"\s*>>\s*", " >> ", s)                         # normalize >>
+        s = _re.sub(r"\s+", " ", s).strip()                         # squeeze spaces
+        return s
+
+    # keep old names working too
+_sanitize = sanitize_payload
+_sanitize_payload = sanitize_payload
+    
 def line_matches(line: str, cfg: dict) -> bool:
     """
     Payload-first matcher with robust 'literal + *** wildcard' support.
@@ -268,7 +285,7 @@ def line_matches(line: str, cfg: dict) -> bool:
         return s
 
 
-    def _extract_payload(line_txt: str) -> str:
+    def _extract_payload(line: str) -> str:
         """
         Best-effort payload slice from a full DLT row.
           1) If '[EVALUATION]:' exists, return from there.
@@ -276,56 +293,39 @@ def line_matches(line: str, cfg: dict) -> bool:
           3) Else try colon slice (common header: '...: payload').
           4) Else whole line trimmed.
         """
-        if not isinstance(line_txt, str):
+        if not isinstance(line, str):
             try:
-                line_txt = line_txt.decode("utf-8", "ignore")
+                line = line.decode("utf-8", "ignore")
             except Exception:
-                line_txt = str(line_txt)
+                line = str(line)
 
         # 1) anchor on [EVALUATION]:
-        pos = line_txt.rfind("[EVALUATION]:")
+        pos = line.rfind("[EVALUATION]:")
         if pos != -1:
-            return line_txt[pos:].strip()
+            return line[pos:].strip()
 
         # 2) after last closing bracket (end of args/headers)
-        rbr = line_txt.rfind("]")
-        if rbr != -1 and rbr + 1 < len(line_txt):
-            tail = line_txt[rbr + 1 :].strip()
+        rbr = line.rfind("]")
+        if rbr != -1 and rbr + 1 < len(line):
+            tail = line[rbr + 1 :].strip()
             if tail:
                 return tail
 
         # 3) colon slice (header: '...: payload')
-        p = line_txt.find(": ")
+        p = line.find(": ")
         if 0 < p < 180:  # keep this conservative
-            tail = line_txt[p + 2 :].lstrip()
+            tail = line[p + 2 :].lstrip()
             if tail:
                 return tail
 
     # 4) fallback
-    return line_txt.strip()
+    return line.strip()
 
     # ---- Payload cleaning helpers (public) --------------------------------
 
 
     # ---- Unified payload sanitizer (simple, robust) ----
-
-    import re as _re
-    def sanitize_payload(payload: str) -> str:
-        if not payload:
-            return ""
-        s = payload.replace("\r", " ").replace("\n", " ")
-        s = "".join(ch for ch in s if (32 <= ord(ch) <= 126) or ch in "\t ")
-        for tok in {"TELETELE", "AOTA", "CCU2s", "CCU2c"}:
-            s = s.replace(tok, " ")
-        s = _re.sub(r"\b([A-Z]{3,10})(?:\1)+\b", r"\1", s)          # OTAOTA -> OTA
-        s = _re.sub(r"=\s*[A-Z]{2,10}\d*[a-z]?\b", " ", s)          # strip '=CCU2x'
-        s = _re.sub(r"\s*>>\s*", " >> ", s)                         # normalize >>
-        s = _re.sub(r"\s+", " ", s).strip()                         # squeeze spaces
-        return s
-
-    # keep old names working too
-    _sanitize = sanitize_payload
-    _sanitize_payload = sanitize_payload
+  
 
 
     
