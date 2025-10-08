@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 # TRE_json.py — core checks & report utilities used by TRE_ui.pyw / TRE_online.py
 # Minimal, compatible implementation.
@@ -304,28 +305,28 @@ def line_matches(line: str, cfg: dict) -> bool:
     return line_txt.strip()
 
     # ---- Payload cleaning helpers (public) --------------------------------
-import re as _re
 
+
+    # ---- Unified payload sanitizer (simple, robust) ----
+
+    import re as _re
     def sanitize_payload(payload: str) -> str:
-        """Flatten and clean a DLT payload: single line, printable, fewer artifacts."""
         if not payload:
             return ""
-        # 1) flatten CR/LF
         s = payload.replace("\r", " ").replace("\n", " ")
-        # 2) strip non-printables
         s = "".join(ch for ch in s if (32 <= ord(ch) <= 126) or ch in "\t ")
-        # 3) normalize spaces around '>>'
-        s = _re.sub(r"\s*>>\s*", " >> ", s)
-        # 4) collapse weird repeats like OTAOTA -> OTA
-        s = _re.sub(r"\b([A-Z]{3,10})(?:\1)+\b", r"\1", s)
-        # 5) drop tail tags like '=CCU2x' or '=ABC123x'
-        s = _re.sub(r"=\s*[A-Z]{2,10}\d*[a-z]?\b", " ", s)
-        # 6) squeeze whitespace
-        s = _re.sub(r"\s+", " ", s).strip()
+        for tok in {"TELETELE", "AOTA", "CCU2s", "CCU2c"}:
+            s = s.replace(tok, " ")
+        s = _re.sub(r"\b([A-Z]{3,10})(?:\1)+\b", r"\1", s)          # OTAOTA -> OTA
+        s = _re.sub(r"=\s*[A-Z]{2,10}\d*[a-z]?\b", " ", s)          # strip '=CCU2x'
+        s = _re.sub(r"\s*>>\s*", " >> ", s)                         # normalize >>
+        s = _re.sub(r"\s+", " ", s).strip()                         # squeeze spaces
         return s
 
-    # Backwards-compat private alias (so calls to tre._sanitize_payload work)
+    # keep old names working too
+    _sanitize = sanitize_payload
     _sanitize_payload = sanitize_payload
+
 
     
     def _build_candidates(src: str) -> list[str]:
@@ -729,4 +730,3 @@ def parse_dlt(line: str):
         return (None, None, None, payload)
     except Exception:
         return (None, None, None, line)
-
