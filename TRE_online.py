@@ -1,23 +1,36 @@
- # =====================================================================
-# TRE_online.py — Online Runner / Engine  •  Version 2.3.1p (Parser Focus)
+# =====================================================================
+# TRE_online.py — Online Runner / Engine  •  Version 2.3.2
 # Test Run Engine (TRE)
 #
-# Extended feature set:
-#  - Payload-only parser & logger (CHUNK P)
-#  - Optional LOG_ONLY_MODE (no matching, just payload logging)
-#  - Optional normalization + token filters
-#  - Sequential verification preserved
-#  - Actions: wait, wait_capture, screenshot, tap, tap_pct
+# Focus (keeps previous behavior, adds stability):
+#  - Default timeout stays 0.0 (no auto timeouts unless set per step)
+#  - Strict, safe history catch-up (no instant PASS without a real match)
+#  - Payload-only parser + payload_tap.log (1 line per payload)
+#  - LOG_ONLY_MODE (when True, only logs payload; no matching)
+#  - Sequential verification preserved (VERIFY_SEQUENTIAL = True)
+#  - Actions: wait, wait_capture, screenshot, tap, tap_pct (unchanged)
 #  - Stop: immediate (socket shutdown)
-#  - Auto reconnect (configurable)
+#  - Auto reconnect retained
+#
+# Notes:
+#  - All previous toggles preserved but de-duplicated
+#  - You can enable debug per-step via DEBUG_STEPS = {7} for example
 # =====================================================================
 
 from __future__ import annotations
-import os, socket, time, datetime, traceback, subprocess, collections
+import os, socket, time, datetime, traceback, subprocess, collections, re
 from typing import Dict, Any, List, Optional, Callable, Tuple, Deque
 from collections import deque
 
-import TRE_ai as ai
+# Optional AI helper (safe no-op if missing)
+try:
+    import TRE_ai as ai
+except Exception:
+    class _AIShim:
+        def is_enabled(self): return False
+        def rca_summary(self, *a, **k): return ""
+    ai = _AIShim()
+
 import TRE_json as tre
 try:
     import TRE_android as droid
@@ -25,48 +38,108 @@ try:
 except Exception:
     ANDROID_OK = False
 
-# --- Paths ------------------------------------------------------------
+
+# === CHUNK 0 — Paths & files =========================================
 ROOT_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGS_DIR    = os.path.join(ROOT_DIR, "Logs")
 REPORTS_DIR = os.path.join(ROOT_DIR, "Reports")
 os.makedirs(LOGS_DIR, exist_ok=True)
 os.makedirs(REPORTS_DIR, exist_ok=True)
-AI_LOG_FILE = os.path.join(LOGS_DIR, "ai_debug.log")
-
-MATCH_DEBUG = True
-DEBUG_STEPS = {7}            # only step 7’s FIND/SEQ traces
-DEBUG_NAME_CONTAINS = []     # or ["Processing"] if you prefer by name
-DEBUG_VERBOSE_RAW = False
 
 WIRE_TAP_FILE    = os.path.join(LOGS_DIR, "wire_tap.log")
-MATCH_LOG_FILE   = os.path.join(LOGS_DIR, "match_debug.log")
-PAYLOAD_TAP_FILE = os.path.join(LOGS_DIR, "payload_tap.log")
+MATCH_LOG_FILE   = os.path.join(LOGS_DIR, "match_debug.log")   # detailed matching/debug
+PAYLOAD_TAP_FILE = os.path.join(LOGS_DIR, "payload_tap.log")   # payload-only stream
+AI_LOG_FILE      = os.path.join(LOGS_DIR, "ai_debug.log")
 
-# --- Network / Engine Tunables ---------------------------------------
+def _safe_open(path, mode):
+    try: return open(path, mode, encoding="utf-8", errors="ignore")
+    except Exception: return None
+
+wire_fh     = _safe_open(WIRE_TAP_FILE, "a")
+_match_fh   = _safe_open(MATCH_LOG_FILE, "a")
+_payload_fh = _safe_open(PAYLOAD_TAP_FILE, "a")
+_ai_fh      = _safe_open(AI_LOG_FILE, "a")
+
+def _ai_log(msg: str) -> None:
+    if not _ai_fh: return
+    try:
+        _ai_fh.write(msg + ("\n" if not msg.endswith("\n") else ""))
+        _ai_fh.flush()
+    except Exception:
+        pass
+
+
+# === CHUNK 1 — Engine tunables & toggles (single source of truth) ====
 CONNECT_TIMEOUT_SEC    = 5.0
 RECV_BLOCK_BYTES       = 65536
 RETRY_MAX_ATTEMPTS     = 5
 RETRY_BACKOFF_BASE_S   = 0.5
 SETTLE_DELAY_S         = 3.0
 RING_BUFFER_MAX_LINES  = 20000
+
 STEP1_TIMEOUT_S        = 120.0
-DEFAULT_STEP_TIMEOUT_S = 0.0     # others default to no-timeout unless test overrides
+DEFAULT_STEP_TIMEOUT_S = 0.0     # keep as requested
+
 IDLE_TICK_S            = 0.20
 WAIT_DRAIN_TICK_S      = 0.05
 
-# --- Matching / Debug / Behavior Toggles ------------------------------
-FORCE_PAYLOAD_ONLY   = True       # force payload matching in ONLINE
-MATCH_DEBUG          = True
-DEBUG_STEPS: set[int]= set()      # e.g. {7}
-DEBUG_NAME_CONTAINS  = []         # e.g. ["Processing"]
-DEBUG_VERBOSE_RAW    = False
-HISTORY_MAX_PER_STEP = 200        # per-step payload history (for debug)
-AUTO_RECONNECT       = True       # reconnect when TCP drops
-RECONNECT_MAX        = 3
-RECONNECT_DELAY_S    = 1.0
+# Behavior
+FORCE_PAYLOAD_ONLY     = True    # online: match payload only
+VERIFY_SEQUENTIAL      = True    # strict order execution
+LOG_ONLY_MODE          = False   # True => log payload only, skip matching
+
+# Debug controls
+MATCH_DEBUG            = True
+DEBUG_STEPS: set[int]  = set()   # e.g. {7}
+DEBUG_NAME_CONTAINS: List[str] = []  # e.g. ["Processing"]
+DEBUG_VERBOSE_RAW      = False
+HISTORY_MAX_PER_STEP   = 200     # for debugging
+AUTO_RECONNECT         = True
+RECONNECT_MAX          = 3
+RECONNECT_DELAY_S      = 1.0
 
 def _now_s() -> float: return time.monotonic()
 
+
+# === CHUNK P — Payload sanitization and logging =======================
+# Precompiled helpers for cleanup
+_RX_REPEAT_ALLCAPS = re.compile(r"\b([A-Z]{3,10})(?:\1)+\b")   # OTAOTA -> OTA
+_RX_EQ_TAIL        = re.compile(r"=\s*[A-Z]{2,10}\d*[a-z]?\b") # =CCU2x / =ABC123x
+_RX_MULTI_WS       = re.compile(r"\s+")
+_RX_NON_PRINT      = re.compile(r"[^\x20-\x7E\t ]+")
+
+_DENY_TOKENS = {"TELETELE", "AOTA", "CCU2s", "CCU2c"}  # harmless junk remnants
+
+def _sanitize_payload(payload: str) -> str:
+    """Produce one clean, readable, single-line payload for logging & matching."""
+    if not payload:
+        return ""
+    # flatten lines
+    s = payload.replace("\r", " ").replace("\n", " ")
+    # strip non-printables
+    s = _RX_NON_PRINT.sub(" ", s)
+    # remove known junk tokens
+    for tok in _DENY_TOKENS:
+        s = s.replace(tok, " ")
+    # collapse repeated ALLCAPS
+    s = _RX_REPEAT_ALLCAPS.sub(r"\1", s)
+    # strip tail like =CCU2x
+    s = _RX_EQ_TAIL.sub(" ", s)
+    # normalize whitespace (and normalize spacing around >>)
+    s = re.sub(r"\s*>>\s*", " >> ", s)
+    s = _RX_MULTI_WS.sub(" ", s).strip()
+    return s
+
+def _log_payload_line(payload: str) -> None:
+    if not payload or not _match_fh: return
+    try:
+        _match_fh.write(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {payload}\n")
+        _match_fh.flush()
+    except Exception:
+        pass
+
+
+# === CHUNK 2 — Small helpers =========================================
 class LineRing:
     def __init__(self, max_lines: int = RING_BUFFER_MAX_LINES):
         self._dq: Deque[str] = collections.deque(maxlen=max_lines)
@@ -74,86 +147,8 @@ class LineRing:
     def drain(self) -> List[str]: out = list(self._dq); self._dq.clear(); return out
     def __len__(self): return len(self._dq)
 
-def _safe_open(path, mode):
-    try: return open(path, mode, encoding="utf-8", errors="ignore")
-    except Exception: return None
 
-wire_fh     = _safe_open(WIRE_TAP_FILE, "a")
-_match_fh   = _safe_open(MATCH_LOG_FILE, "a") if MATCH_DEBUG else None
-_payload_fh = _safe_open(PAYLOAD_TAP_FILE, "a")
-
-# ---------- CHUNK P: Robust payload cleanup, logging, and LOG-ONLY mode -----
-
-# Behavior toggles
-FORCE_PAYLOAD_ONLY           = True     # online: match payload only
-VERIFY_SEQUENTIAL            = True     # strict order execution
-MATCH_DEBUG                  = True     # write match_debug.log
-LOG_ONLY_MODE                = False    # <-- set True to stream & log only (no matching)
-
-# Logging controls
-SANITIZE_NON_PRINTABLE       = True
-NORMALIZE_PAYLOAD_WHITESPACE = True
-PAYLOAD_LOG_FILTER_ANY       = []       # e.g. ["UCM_CHK", "OTA"]
-
-# Known junk tokens occasionally leaking from headers
-DENY_TOKENS                  = {"TELETELE", "AOTA"}
-
-import re as _re
-
-# Precompiled cleaners
-_RX_REPEAT_ALLCAPS   = _re.compile(r"\b([A-Z]{3,10})(?:\1)+\b")     # OTAOTA->OTA
-_RX_EQUALS_TAIL      = _re.compile(r"=\s*[A-Z]{2,10}\d*[a-z]?\b")   # =CCU2x, =ABC123x
-_RX_MULTI_WS         = _re.compile(r"\s+")
-_RX_STRIP_CONTROL    = _re.compile(r"[^\x20-\x7E\t ]+")             # keep printable + tab + space
-
-# --- keep near CHUNK P ---
-
-def _sanitize_payload(payload: str) -> str:
-    """Clean payload for both logging and matching (single line, readable)."""
-    if not payload:
-        return payload
-
-    # 1) flatten CR/LF to enforce one physical line per payload
-    payload = payload.replace("\r", " ").replace("\n", " ")
-
-    # 2) strip non-printables
-    payload = "".join(ch for ch in payload if (32 <= ord(ch) <= 126) or ch in "\t ")
-
-    # 3) optional: remove known junk tokens
-    for tok in {"TELETELE", "AOTA", "CCU2s", "CCU2c"}:
-        payload = payload.replace(tok, " ")
-
-
-    # 4) collapse occasional repeated ALLCAPS (OTAOTA -> OTA)
-    import re as _re
-    payload = _re.sub(r"\b([A-Z]{3,10})(?:\1)+\b", r"\1", payload)
-
-    # 5) strip header-ish tails like =CCU2x / =ABC123x
-    payload = _re.sub(r"=\s*[A-Z]{2,10}\d*[a-z]?\b", " ", payload)
-
-    # 6) normalize whitespace
-    payload = _re.sub(r"\s+", " ", payload).strip()
-    return payload
-
-
-def _log_payload_line(payload: str) -> None:
-    """Append the CLEANED single-line payload to match_debug.log."""
-    if not payload or not _match_fh:
-        return
-    try:
-        _match_fh.write(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {payload}\n")
-        _match_fh.flush()
-    except Exception:
-        pass
-
-# ---------- END CHUNK P ------------------------------------------------------
-
-
-
-
-# =====================================================================
-# Android fallback (adbb) — minimal -----------------------------------
-# =====================================================================
+# === CHUNK 3 — Android fallback (adbb) ================================
 class _AdbDirect:
     def __init__(self, exe: str = "adbb"): self.exe = exe
     def tap(self, x:int, y:int)->bool:
@@ -175,9 +170,8 @@ class _AdbDirect:
             return r.returncode==0 and os.path.exists(out_file) and os.path.getsize(out_file)>0
         except Exception: return False
 
-# =====================================================================
-# SESSION MANAGER
-# =====================================================================
+
+# === CHUNK 4 — SessionManager (lifecycle, I/O, dispatch) =============
 class SessionManager:
     def __init__(self,host:str,port:int,tests:List[Dict[str,Any]],out_dir:str,
                  snapshot_interval:int=10,on_status=None,on_steps_init=None,on_step_update=None):
@@ -188,23 +182,45 @@ class SessionManager:
         self.on_status=on_status or (lambda m:None)
         self.on_steps_init=on_steps_init or (lambda lst:None)
         self.on_step_update=on_step_update or (lambda i,n,v,r,l:None)
+
+        # connection / control
         self._sock=None; self._running=False; self._paused=False
+
+        # assemble & buffers
         self._buf=""; self._ring=LineRing(); self._matching_enabled=False
         self._prefeed_lines: List[str] = []
+        self._payload_history: Deque[str] = deque(maxlen=5000)  # CLEAN payload cache
+
+        # actions
         self._action_ptr=1
         self._dev_w=0; self._dev_h=0; self._adb=_AdbDirect("adbb")
+
+        # per-step debug
         self._hist: Dict[int, Deque[str]] = {}
         self._counts: Dict[int, int] = {}
-        self._payload_history = deque(maxlen=5000)  # keep last N cleaned payloads
 
+    # ---- Debug helpers
+    def _dbg_on(self, idx: Optional[int], name: Optional[str]) -> bool:
+        if not MATCH_DEBUG: return False
+        if not DEBUG_STEPS and not DEBUG_NAME_CONTAINS: return True
+        if DEBUG_STEPS and idx is not None and idx in DEBUG_STEPS: return True
+        if DEBUG_NAME_CONTAINS and name:
+            low=name.lower()
+            return any(sub.lower() in low for sub in DEBUG_NAME_CONTAINS)
+        return False
 
-    # ---- Payload logger wrapper --------------------------------------
-    def _log_payload(self, payload: str) -> None:
-        _log_payload_line(payload)
+    def _dbg(self, msg: str) -> None:
+        if not _match_fh: return
+        try:
+            _match_fh.write(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
+            _match_fh.flush()
+        except Exception:
+            pass
 
-    # ---- Lifecycle ---------------------------------------------------
+    # ---- Lifecycle
     def pause(self):  self._paused=True;  self.on_status("Paused.")
     def resume(self): self._paused=False; self.on_status("Resumed.")
+
     def stop(self):
         self._running=False; self._paused=False
         self._buf=""; self._ring.drain(); self._prefeed_lines.clear()
@@ -217,31 +233,32 @@ class SessionManager:
         finally:
             self._sock=None
 
-    # ---- Start -------------------------------------------------------
+    # ---- Start
     def start(self):
-        # reset state
+        # reset
         for t in self.tests:
             t.pop("_done",None); t.pop("_seq_idx",None); t.pop("_t0", None); t.pop("_count", None)
         self._ring=LineRing(); self._matching_enabled=False; self._action_ptr=1
-        self._hist.clear(); self._counts.clear()
+        self._hist.clear(); self._counts.clear(); self._payload_history.clear()
 
-        # connect with retries
+        # connect
         s=self._connect_with_retries()
         if not s: self.on_status("Failed to connect."); return
         self._sock=s; self._running=True; self.on_status("Connected.")
 
-        # init steps
+        # init table
         now=time.monotonic()
         for i,t in enumerate(self.tests, start=1):
             t["_done"]=False; t["_seq_idx"]=0; t["_t0"]=now; t["_count"]=0
             self._hist[i]=collections.deque(maxlen=HISTORY_MAX_PER_STEP)
             self._counts[i]=0
+
         steps_info=[{"idx":i,"name":t.get("name",f"Step {i}"),"vc":self._describe_vc(t)}
                     for i,t in enumerate(self.tests,1)]
         try: self.on_steps_init(steps_info)
         except Exception: pass
 
-        # settle boot lines
+        # settle
         settle_until=_now_s()+SETTLE_DELAY_S
         self.on_status(f"Settling for {SETTLE_DELAY_S:.1f}s to capture boot logs…")
         try:
@@ -263,7 +280,7 @@ class SessionManager:
         disconnects=0
         try:
             while self._running:
-                # prefeed from wait_capture first
+                # prefeed (from wait_capture)
                 while self._prefeed_lines and self._running and not self._paused:
                     ln=self._prefeed_lines.pop(0)
                     self._process_line_dispatch(ln)
@@ -278,6 +295,7 @@ class SessionManager:
                             self.on_status("Reconnected.")
                             continue
                     break
+
                 if text:
                     self._buf+=text
                     while True:
@@ -292,16 +310,14 @@ class SessionManager:
                             self._ring.append(raw); continue
                         self._process_line_dispatch(raw)
 
-                # timeouts + actions
-                self._check_timeouts()
+                # no default timeouts (DEFAULT_STEP_TIMEOUT_S = 0.0) — only per-step if provided
                 self._run_pending_actions()
-                # Catch-up: if the next step was already satisfied by earlier payloads, pass it now
+
+                # strict, SAFE catch-up (optional): current step only, only PASS on real match
                 cur = self._first_unfinished_idx()
                 if cur is not None:
                     self._scan_history_for_step(cur)
 
-
-                # done?
                 if self._all_done(): self._running=False
                 time.sleep(IDLE_TICK_S)
 
@@ -311,7 +327,7 @@ class SessionManager:
             try: self._finalize_unfinished("stopped" if not self._running else "ended")
             except Exception: pass
             # flush logs
-            for fh in (wire_fh,_match_fh,_payload_fh):
+            for fh in (wire_fh,_match_fh,_payload_fh,_ai_fh):
                 try:
                     if fh: fh.flush()
                 except Exception: pass
@@ -326,20 +342,15 @@ class SessionManager:
                 except Exception: pass
                 self._sock=None; self._running=False; self._paused=False
                 self.on_status("Stopped.")
-            # ensure payload debug flushed
+
+            # optional AI summary (unchanged behavior)
             try:
-                if _match_fh: _match_fh.flush()
-            except Exception: pass
-            
-                        # --- AI RCA summary after run (if anything failed) ---
-            try:
-                if ai.is_enabled():
+                if hasattr(ai, "is_enabled") and ai.is_enabled():
                     failed = []
                     for i, t in enumerate(self.tests, start=1):
                         res = t.get("_final_result")
                         if res and res != "PASS":
-                            # include index so RCA can refer to it
-                            t_summary = {
+                            failed.append({
                                 "_idx": i,
                                 "name": t.get("name", f"Step {i}"),
                                 "find": t.get("find"),
@@ -348,34 +359,25 @@ class SessionManager:
                                 "action": t.get("action"),
                                 "_final_result": res,
                                 "_final_line": t.get("_final_line"),
-                            }
-                            failed.append(t_summary)
-
+                            })
                     if failed:
-                        # gather sanitized history per step (if you keep _hist)
-                        histories = {}
-                        try:
-                            histories = {i: list(self._hist.get(i, [])) for i in range(1, len(self.tests)+1)}
-                        except Exception:
-                            histories = {}
-
+                        histories = {i: list(self._hist.get(i, [])) for i in range(1, len(self.tests)+1)}
                         rca = ai.rca_summary(failed, histories)
                         _ai_log("\n==== RCA SUMMARY ====\n" + rca + "\n=====================\n")
                         self.on_status("[AI] RCA summary written to ai_debug.log")
-            except Exception:
-                pass
 
 
-    # ---- Core parsing / dispatch ------------------------------------
+    # ---- Dispatch: parse -> sanitize -> log -> match (or log-only) ---
     def _process_line_dispatch(self, line: str) -> None:
         # 1) parse and sanitize payload
         try:
             _, _, _, payload_raw = tre.parse_dlt(line)
         except Exception:
             payload_raw = line
-        payload = tre.sanitize_payload(payload_raw)
+        payload = tre.sanitize_payload(payload_raw) if hasattr(tre, "sanitize_payload") else _sanitize_payload(payload_raw)
 
-        # 2) log payload-only (one clean line) for your investigation
+        # 2) append to payload history (for strict catch-up) and log as single line
+        self._payload_history.append(payload)
         if _payload_fh:
             try:
                 _payload_fh.write(payload + "\n")
@@ -383,21 +385,22 @@ class SessionManager:
             except Exception:
                 pass
 
-        if DEBUG_VERBOSE_RAW:
-            self._dbg(f"[RAW] line='{line[:220]}'")
-            self._dbg(f"[PAYLOAD] '{payload}'")
+        if DEBUG_VERBOSE_RAW and self._dbg_on(None, None):
+            self._dbg(f"[RAW] {line[:220]}")
+            self._dbg(f"[PAYLOAD] {payload}")
 
-        # 3) choose matching mode
+        # 3) Logging-only mode?
+        if LOG_ONLY_MODE:
+            return
+
+        # 4) Match in chosen mode (we keep sequential as requested)
         if VERIFY_SEQUENTIAL:
             self._process_line_sequential(line, payload)
         else:
             self._process_line_cumulative(line, payload)
 
 
-
-
-
-    # ---- Connection helpers -----------------------------------------
+    # === CHUNK 5 — Connect / I/O =====================================
     def _connect_with_retries(self) -> Optional[socket.socket]:
         last_err=None
         for attempt in range(1,RETRY_MAX_ATTEMPTS+1):
@@ -464,12 +467,47 @@ class SessionManager:
             except Exception: pass
 
 
- # ---- Sequential verifier (strict order) --------------------------
+    # === CHUNK 6 — Matching (sequential + cumulative) =================
     def _first_unfinished_idx(self) -> Optional[int]:
         for i, t in enumerate(self.tests, start=1):
             if not t.get("_done"):
                 return i
         return None
+
+    def _normalize_cfg(self, cfg: Dict[str,Any]) -> Dict[str,Any]:
+        c = dict(cfg or {})
+        # online: payload_only forced
+        c["payload_only"] = True
+        return c
+
+    def _try_find(self, idx:int, cfg:Dict[str,Any], payload:str, name:str) -> bool:
+        c = self._normalize_cfg(cfg)
+        need  = int(c.get("min_count", 1))
+        have  = self._counts.get(idx, 0)
+        if self._dbg_on(idx, name):
+            self._dbg(f"[FIND] step#{idx} need={need} have={have} pat='{c.get('pattern')}' | payload='{payload[:220]}'")
+        if tre.line_matches(payload, c):
+            have += 1
+            self._counts[idx] = have
+            if self._dbg_on(idx, name): self._dbg(f"[FIND] step#{idx} match count={have}")
+            if have >= need:
+                return True
+        return False
+
+    def _try_sequence(self, idx:int, t:Dict[str,Any], payload:str, name:str) -> bool:
+        seq = t.get("sequence", []) or []
+        prog = t.setdefault("_seq_idx", 0)
+        if prog >= len(seq):  # already done
+            return True
+        node = seq[prog]
+        c = node if isinstance(node, dict) else {"pattern": str(node), "literal": True}
+        c = self._normalize_cfg(c)
+        if self._dbg_on(idx, name):
+            self._dbg(f"[SEQ] step#{idx} prog={prog}/{len(seq)} pat='{c.get('pattern')}' | payload='{payload[:220]}'")
+        if tre.line_matches(payload, c):
+            t["_seq_idx"] = prog + 1
+            return t["_seq_idx"] >= len(seq)
+        return False
 
     def _process_line_sequential(self, line: str, payload: str) -> None:
         idx = self._first_unfinished_idx()
@@ -477,108 +515,32 @@ class SessionManager:
         t = self.tests[idx - 1]
         name = t.get("name", f"Step {idx}")
         vc   = self._describe_vc(t)
-        # keep payload history
         self._hist[idx].append(payload)
 
-        # ACTION?
         if "action" in t:
             ok,msg=self._perform_action(t["action"])
             t["_done"]=True; self._emit(idx,name,vc,("PASS" if ok else "FAIL"),msg)
             return
 
-        # FIND
         if "find" in t:
             if self._try_find(idx, t["find"], payload, name):
                 t["_done"]=True; self._emit(idx,name,vc,"PASS",payload)
             return
 
-        # NOT_FIND
         if "not_find" in t:
             cfg = self._normalize_cfg(t["not_find"])
             if tre.line_matches(payload, cfg):
                 t["_done"]=True; self._emit(idx,name,vc,"FAIL",payload)
             return
 
-        # SEQUENCE
         if "sequence" in t:
-            done = self._try_sequence(idx, t, payload, name)
-            if done:
+            if self._try_sequence(idx, t, payload, name):
                 t["_done"]=True; self._emit(idx,name,vc,"PASS",payload)
             return
 
-        # Unknown
+        # unknown
         t["_done"]=True; self._emit(idx,name,vc,"ERROR","Unknown rule")
-    
-    
-    def _scan_history_for_step(self, idx: int) -> bool:
-        """Try to satisfy step idx from buffered payload history (for sequential catch-up)."""
-        if idx < 1 or idx > len(self.tests):
-            return False
 
-        t    = self.tests[idx - 1]
-        name = t.get("name", f"Step {idx}")
-        vc   = self._describe_vc(t)
-
-        # Actions aren't history-matched
-        if "action" in t:
-            return False
-
-        # FIND
-        if "find" in t:
-            cfg = self._normalize_cfg(t["find"])
-            for pl in self._payload_history:
-                if tre.line_matches(pl, cfg):
-                    t["_done"] = True
-                    self._emit(idx, name, vc, "PASS", pl)
-                    return True
-            return False
-
-        # NOT_FIND: history can only prove FAIL (if forbidden exists)
-        if "not_find" in t:
-            cfg = self._normalize_cfg(t["not_find"])
-            for pl in self._payload_history:
-                if tre.line_matches(pl, cfg):
-                    t["_done"] = True
-                    self._emit(idx, name, vc, "FAIL", pl)
-                    return True
-            return False
-
-        # SEQUENCE (keeps advancing until fully satisfied)
-        if "sequence" in t:
-            seq = t.get("sequence", []) or []
-            if not seq:
-                t["_done"] = True
-                self._emit(idx, name, vc, "PASS", "")
-                return True
-
-            prog = t.setdefault("_seq_idx", 0)
-            while prog < len(seq):
-                node = seq[prog]
-                c = node if isinstance(node, dict) else {"pattern": str(node), "literal": True}
-                c = self._normalize_cfg(c)
-                # see if any history entry matches this node
-                hit = any(tre.line_matches(pl, c) for pl in self._payload_history)
-                if not hit:
-                    return False
-                prog += 1
-                t["_seq_idx"] = prog
-
-            # whole sequence satisfied
-            t["_done"] = True
-            # provide last matching line if convenient (optional)
-            last_line = next((pl for pl in reversed(self._payload_history)
-                              if tre.line_matches(pl, self._normalize_cfg(seq[-1] if isinstance(seq[-1], dict)
-                                                                          else {"pattern": str(seq[-1]), "literal": True}))), "")
-            self._emit(idx, name, vc, "PASS", last_line)
-            return True
-
-        # Unknown rule
-        t["_done"] = True
-        self._emit(idx, name, vc, "ERROR", "Unknown rule")
-        return True
-
-    
-    # ---- Cumulative verifier (kept for compatibility) ----------------
     def _process_line_cumulative(self, line: str, payload: str) -> None:
         for idx0, t in enumerate(self.tests):
             if t.get("_done"): continue
@@ -588,7 +550,7 @@ class SessionManager:
             self._hist[idx].append(payload)
 
             if "action" in t:
-                continue  # actions run via _run_pending_actions()
+                continue  # actions are run via _run_pending_actions()
 
             if "find" in t:
                 if self._try_find(idx, t["find"], payload, name):
@@ -608,56 +570,65 @@ class SessionManager:
 
             t["_done"]=True; self._emit(idx,name,vc,"ERROR","Unknown rule")
 
-    # ---- Match helpers -----------------------------------------------
-    def _normalize_cfg(self, cfg: Dict[str,Any]) -> Dict[str,Any]:
-        c = dict(cfg or {})
-        # enforce payload-only unless caller already opted out
-        c["payload_only"] = True if FORCE_PAYLOAD_ONLY else c.get("payload_only", True)
-        return c
 
-    def _try_find(self, idx:int, cfg:Dict[str,Any], payload:str, name:str) -> bool:
-        c = self._normalize_cfg(cfg)
-        need  = int(c.get("min_count", 1))
-        maxi  = int(c.get("max_count", need))
-        if DEBUG_VERBOSE_RAW or idx in DEBUG_STEPS or (DEBUG_NAME_CONTAINS and any(s.lower() in name.lower() for s in DEBUG_NAME_CONTAINS)):
-            if _match_fh:
-                try:
-                    _match_fh.write(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] [FIND] step#{idx} '{name}' need={need} have={self._counts.get(idx,0)} pat='{c.get('pattern')}' literal={c.get('literal')} ignore_case={c.get('ignore_case')} payload_only={c.get('payload_only')} | line='{payload[:220]}'\n")
-                    _match_fh.flush()
-                except Exception: pass
-        if tre.line_matches(payload, c):
-            self._counts[idx] = self._counts.get(idx, 0) + 1
-            have = self._counts[idx]
-            if have >= need:
-                return True
-        return False
+    # === CHUNK 6b — Strict, safe catch-up from history ================
+    def _scan_history_for_step(self, idx: int) -> None:
+        """Only PASS/FAIL a step if a *real* match exists in preserved payload history."""
+        if idx < 1 or idx > len(self.tests): 
+            return
+        t = self.tests[idx - 1]
+        if t.get("_done"): return
+        if "action" in t:  # only verification here
+            return
 
-    def _try_sequence(self, idx:int, t:Dict[str,Any], payload:str, name:str) -> bool:
-        seq = t.get("sequence", []) or []
-        prog = t.setdefault("_seq_idx", 0)
-        if prog >= len(seq):  # already done
-            return True
-        node = seq[prog]
-        c = node if isinstance(node, dict) else {"pattern": str(node), "literal": True}
-        c = self._normalize_cfg(c)
-        if DEBUG_VERBOSE_RAW or idx in DEBUG_STEPS or (DEBUG_NAME_CONTAINS and any(s.lower() in name.lower() for s in DEBUG_NAME_CONTAINS)):
-            if _match_fh:
-                try:
-                    _match_fh.write(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] [SEQ] step#{idx} '{name}' prog={prog}/{len(seq)} pat='{c.get('pattern')}' literal={c.get('literal')} ignore_case={c.get('ignore_case')} payload_only={c.get('payload_only')} | line='{payload[:220]}'\n")
-                    _match_fh.flush()
-                except Exception: pass
-        if tre.line_matches(payload, c):
-            t["_seq_idx"] = prog + 1
-            return t["_seq_idx"] >= len(seq)
-        return False
+        name = t.get("name", f"Step {idx}")
+        vc   = self._describe_vc(t)
 
-    # ---- Timeouts / finalize -----------------------------------------
+        def _norm_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+            c = dict(cfg or {})
+            c["payload_only"] = True
+            return c
+
+        # scan older payloads for a true match
+        for payload in list(self._payload_history):
+            if "find" in t:
+                if tre.line_matches(payload, _norm_cfg(t["find"])):
+                    t["_done"] = True
+                    self._emit(idx, name, vc, "PASS", payload)
+                    return
+            elif "not_find" in t:
+                if tre.line_matches(payload, _norm_cfg(t["not_find"])):
+                    t["_done"] = True
+                    self._emit(idx, name, vc, "FAIL", payload)
+                    return
+            elif "sequence" in t:
+                seq = t.get("sequence", []) or []
+                prog = t.setdefault("_seq_idx", 0)
+                if prog >= len(seq):
+                    t["_done"] = True
+                    self._emit(idx, name, vc, "PASS", "")
+                    return
+                node = seq[prog]
+                c = node if isinstance(node, dict) else {"pattern": str(node), "literal": True}
+                c = _norm_cfg(c)
+                if tre.line_matches(payload, c):
+                    t["_seq_idx"] = prog + 1
+                    if t["_seq_idx"] >= len(seq):
+                        t["_done"] = True
+                        self._emit(idx, name, vc, "PASS", payload)
+                        return
+        # If no match found, do nothing (no instant PASS).
+
+
+    # === CHUNK 7 — Timeouts / finalize / emit / VC ====================
     def _current_timeout_s(self, idx:int, t:Dict[str,Any])->float:
+        # default stays 0.0 unless per-step overrides
         if isinstance(t.get("timeout"), (int, float)) and t["timeout"] >= 0:
             return float(t["timeout"])
         return STEP1_TIMEOUT_S if idx == 1 else DEFAULT_STEP_TIMEOUT_S
 
     def _check_timeouts(self)->None:
+        # With DEFAULT_STEP_TIMEOUT_S = 0.0 this only triggers if a step sets "timeout": N
         if not self._running: return
         now=_now_s()
         for idx,t in enumerate(self.tests,1):
@@ -685,7 +656,6 @@ class SessionManager:
             else:
                 t["_done"]=True; self._emit(i,name,vc,"FAIL",f"[{reason}: pattern never seen]")
 
-    # ---- Emit / describe ---------------------------------------------
     def _emit(self,idx:int,name:str,vc:str,result:str,line:Optional[str]):
         try:
             if self.on_step_update: self.on_step_update(idx,name,vc,result,line)
@@ -693,45 +663,6 @@ class SessionManager:
             t["_final_result"] = result
             t["_final_line"]   = line
         except Exception: pass
-        
-                # --- AI debug on failure (non-blocking; safe to ignore errors) ---
-        try:
-            if result == "FAIL" and ai.is_enabled():
-                # build a minimal step dict for context (pattern + name)
-                step = {
-                    "name": name,
-                    "find": None,
-                    "not_find": None,
-                    "sequence": None
-                }
-                # try to attach whichever exists on the real test
-                try:
-                    t = self.tests[idx - 1]
-                    for k in ("find", "not_find", "sequence", "action"):
-                        if k in t: step[k] = t.get(k)
-                except Exception:
-                    pass
-
-                # collect recent sanitized payloads for this step
-                samples = list(self._hist.get(idx, []))[-30:] if hasattr(self, "_hist") else []
-
-                # 1) narrow down relevant lines
-                rel = ai.select_relevant_payload(step, samples, max_lines=12)
-                if rel:
-                    _ai_log(f"[step#{idx} {name}] relevant lines:")
-                    for r in rel:
-                        _ai_log(f"  • {r}")
-
-                # 2) concise why-failed + suggested pattern
-                why = ai.explain_failure(step, rel or samples)
-                _ai_log(f"[step#{idx} {name}] explain:\n{why}")
-
-                # also surface a short status in UI footer
-                self.on_status(f"[AI] Step#{idx} '{name}' failed — see ai_debug.log")
-        except Exception:
-            # never break the run if AI/logging fails
-            pass
-
 
     def _describe_vc(self,t:Dict[str,Any])->str:
         if "find" in t: return str(t["find"].get("pattern",""))
@@ -745,12 +676,12 @@ class SessionManager:
                 fn=a.get("file"); return f"[screenshot]{' → '+fn if fn else ''}"
             if at in ("wait","wait_capture"):
                 ms=a.get("ms",""); return f"[{at} {ms}ms]"
-            if at in ("tap","tap_pct"):
-                return f"[{at}]"
+            if at in ("tap","tap_pct"): return f"[{at}]"
             return f"[{at}]"
         return "(unknown)"
 
-    # ---- Actions (sequential via _run_pending_actions) ----------------
+
+    # === CHUNK 8 — Actions ============================================
     def _run_pending_actions(self)->None:
         while self._running and self._action_ptr <= len(self.tests):
             i = self._action_ptr
@@ -802,7 +733,7 @@ class SessionManager:
                 except Exception as e:
                     return False, f"screenshot error: {e}"
             else:
-                ok = self._adb.screencap_png_to(out_path)
+                ok = _AdbDirect("adbb").screencap_png_to(out_path)
                 return (ok, out_path if ok else "screenshot failed")
 
         # TAP
@@ -818,7 +749,7 @@ class SessionManager:
                 except Exception as e:
                     return False, f"tap error: {e}"
             else:
-                ok = self._adb.tap(x, y); return ok, f"tap({x},{y}) {'ok' if ok else 'fail'}"
+                ok = _AdbDirect("adbb").tap(x, y); return ok, f"tap({x},{y}) {'ok' if ok else 'fail'}"
 
         # TAP_PCT
         if at == "tap_pct":
@@ -828,22 +759,31 @@ class SessionManager:
                 if ANDROID_OK:
                     droid.ensure_server(); ser = droid.get_default_device_serial()
                     if not ser: return False, "No Android device"
-                    if self._dev_w <= 0 or self._dev_h <= 0:
-                        wh = droid.device_wm_size(serial=ser); 
-                        if wh: self._dev_w, self._dev_h = wh
-                    if self._dev_w <= 0 or self._dev_h <= 0: return False, "unknown device size"
-                    x = int(round(px * self._dev_w)); y = int(round(py * self._dev_h))
+                    # try device size
+                    w,h = 0,0
+                    try:
+                        wh = droid.device_wm_size(serial=ser)
+                        if wh: w,h = wh
+                    except Exception:
+                        w=h=0
+                    if w<=0 or h<=0:
+                        w,h = self._guess_wm_size()
+                    if w<=0 or h<=0: return False, "unknown device size"
+                    x = int(round(px * w)); y = int(round(py * h))
                     ok = droid.input_tap(x, y, serial=ser)
                     return ok, f"tap_pct({px:.2f},{py:.2f})=>({x},{y}) {'ok' if ok else 'fail'}"
                 else:
-                    # fallback cannot compute pct without size; keep simple (optional)
-                    return False, "tap_pct unavailable without device size"
+                    w,h = self._guess_wm_size()
+                    if w<=0 or h<=0: return False, "unknown device size"
+                    x = int(round(px * w)); y = int(round(py * h))
+                    ok = _AdbDirect("adbb").tap(x, y)
+                    return ok, f"tap_pct({px:.2f},{py:.2f})=>({x},{y}) {'ok' if ok else 'fail'}"
             except Exception as e:
                 return False, f"tap_pct error: {e}"
 
         return False, f"unknown action: {at}"
 
-    # ---- Wait drain helpers ------------------------------------------
+    # Wait drain helpers
     def _drain_discard_once(self) -> None:
         if not self._sock: return
         try:
@@ -886,7 +826,19 @@ class SessionManager:
             except Exception: pass
         return out
 
-# ---- Compat helper for older TRE_android without screencap_png_to ----
+    def _guess_wm_size(self) -> Tuple[int,int]:
+        try:
+            out = subprocess.check_output(["adbb","shell","wm","size"],
+                                          stderr=subprocess.STDOUT, timeout=1.5).decode("utf-8","ignore")
+            for ln in out.splitlines():
+                if ":" in ln and "x" in ln:
+                    tail=ln.split(":",1)[1].strip()
+                    w,h=tail.split("x"); return (int(w),int(h))
+        except Exception: pass
+        return (0,0)
+
+
+# === CHUNK 9 — Android compat screencap helper =======================
 def _compat_screencap_to(out_path: str) -> bool:
     try:
         tmp_dir = os.path.dirname(out_path) or "."
@@ -903,17 +855,6 @@ def _compat_screencap_to(out_path: str) -> bool:
     except Exception:
         return False
 
-
-# =====================================================================
-# AI
-# =====================================================================
-def _ai_log(msg: str) -> None:
-    try:
-        with open(AI_LOG_FILE, "a", encoding="utf-8", errors="ignore") as fh:
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            fh.write(f"[{ts}] {msg}\n")
-    except Exception:
-        pass
 # =====================================================================
 # End of file
 # =====================================================================
