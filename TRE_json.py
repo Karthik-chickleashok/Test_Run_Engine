@@ -303,26 +303,30 @@ def line_matches(line: str, cfg: dict) -> bool:
     # 4) fallback
     return line_txt.strip()
 
+    # ---- Payload cleaning helpers (public) --------------------------------
+import re as _re
+
     def sanitize_payload(payload: str) -> str:
-        """Flatten to one printable line, drop known noise, normalize spaces & '>>'."""
+        """Flatten and clean a DLT payload: single line, printable, fewer artifacts."""
         if not payload:
             return ""
-        # 1) single physical line
+        # 1) flatten CR/LF
         s = payload.replace("\r", " ").replace("\n", " ")
-        # 2) printable ASCII + tabs/spaces only
+        # 2) strip non-printables
         s = "".join(ch for ch in s if (32 <= ord(ch) <= 126) or ch in "\t ")
-        # 3) drop known junk tokens
-        for tok in _JUNK_TOKENS:
-            s = s.replace(tok, " ")
-        # 4) collapse repeated ALLCAPS tokens: OTAOTA -> OTA
-        s = _re.sub(r"\b([A-Z]{3,10})(?:\1)+\b", r"\1", s)
-        # 5) strip header-ish tails like '=CCU2x'
-        s = _TAIL_EQ_TAG.sub(" ", s)
-        # 6) normalize '>>' spacing to a single space around it
+        # 3) normalize spaces around '>>'
         s = _re.sub(r"\s*>>\s*", " >> ", s)
-        # 7) collapse whitespace
+        # 4) collapse weird repeats like OTAOTA -> OTA
+        s = _re.sub(r"\b([A-Z]{3,10})(?:\1)+\b", r"\1", s)
+        # 5) drop tail tags like '=CCU2x' or '=ABC123x'
+        s = _re.sub(r"=\s*[A-Z]{2,10}\d*[a-z]?\b", " ", s)
+        # 6) squeeze whitespace
         s = _re.sub(r"\s+", " ", s).strip()
         return s
+
+    # Backwards-compat private alias (so calls to tre._sanitize_payload work)
+    _sanitize_payload = sanitize_payload
+
     
     def _build_candidates(src: str) -> list[str]:
         raw = _flatten_printable(src)
