@@ -7,7 +7,129 @@ from typing import List, Dict, Any, Tuple
 
 # ---------- Matching ----------
 # TRE_json.py
+# --- Add near top imports if not present ---
 import re
+
+# --- Robust DLT line splitter ---
+_DLTCOLON = re.compile(r'::+')  # matches :: or ::: etc.
+
+# tokens we know are noise in the payload stream
+_DENY_TOKENS = {"TELETELE", "AOTA", "CCU2s", "CCU2c"}
+
+# tail fragments like =CCU2x / =ABC123x that sometimes get glued to payloads
+_re_tail_eq_tag = re.compile(r"=\s*[A-Z]{2,10}\d*[a-z]?\b")
+
+def _split_dlt_header_and_payload(line: str):
+    """
+    Try to split a DLT-ish line into (ecu, app, ctx, payload).
+    Heuristics:
+      - Many tools emit 'ECU::APP::CTX: payload...'
+      - Sometimes more fields exist; we take last 3 '::' separated chunks before payload.
+      - If we can't parse, return (None, None, None, original_line).
+    """
+    s = line.strip()
+
+    # If there are '::' separators, try to use them
+    if '::' in s:
+        parts = _DLTCOLON.split(s)
+        # parts = [maybe prefix, ecu, app, ctx, tail...]
+        # Find a plausible payload separator: the last ':' (single) or first space after ctx.
+        # Simple heuristic: take last part as payload; 2-4 previous as ctx/app/ecu if available.
+        if len(parts) >= 4:
+            payload = parts[-1].lstrip(": ").strip()
+            ctx = parts[-2].strip()
+            app = parts[-3].strip()
+            ecu = parts[-4].strip()
+            # Sometimes there are more than 4; we only care about last four
+            return (ecu or None, app or None, ctx or None, payload or "")
+        elif len(parts) == 3:
+            # ecu::app::payload
+            ecu, app, payload = (parts[0].strip() or None,
+                                 parts[1].strip() or None,
+                                 parts[2].lstrip(": ").strip())
+            return (ecu, app, None, payload or "")
+        elif len(parts) == 2:
+            # header::payload
+            header, payload = parts[0].strip(), parts[1].lstrip(": ").strip()
+            return (None, header or None, None, payload or "")
+
+    # Fallback: look for a single colon after some header-ish token
+    if ': ' in s:
+        hdr, payload = s.split(': ', 1)
+        return (None, None, None, payload.strip())
+
+    # As last resort, whole line is "payload"
+    return (None, None, None, s)
+
+def _text_match(hay: str, pat: str, *, literal: bool, ignore_case: bool, equals: bool) -> bool:
+    if ignore_case:
+        hay_cmp = hay.lower()
+        pat_cmp = pat.lower()
+    else:
+        hay_cmp = hay
+        pat_cmp = pat
+
+    if equals:
+        return hay_cmp == pat_cmp
+
+    if literal:
+        return pat_cmp in hay_cmp
+
+    # regex
+    flags = re.IGNORECASE if ignore_case else 0
+    try:
+        return re.search(pat, hay, flags=flags) is not None
+    except re.error:
+        # If pattern is invalid regex, fallback to substring
+        return pat_cmp in hay_cmp
+
+def line_matches(line: str, cfg: dict) -> bool:
+    """
+    cfg keys we honor:
+      - pattern (str)           [required]
+      - literal (bool)          default True for your use-case
+      - ignore_case (bool)      default False
+      - equals (bool)           default False (exact match)
+      - payload_only (bool)     default True in ONLINE (set by TRE_online)
+      - ecu / app / ctx (str)   optional header constraints (respect literal/ignore_case/equals)
+      - min_count (int)         handled by caller (TRE_online)
+    """
+    if not isinstance(cfg, dict):
+        return False
+
+    pattern      = str(cfg.get("pattern", ""))
+    if not pattern:
+        return False
+
+    literal      = bool(cfg.get("literal", True))
+    ignore_case  = bool(cfg.get("ignore_case", False))
+    equals       = bool(cfg.get("equals", False))
+    payload_only = bool(cfg.get("payload_only", False))
+
+    # Header constraints (optional)
+    need_ecu = cfg.get("ecu")
+    need_app = cfg.get("app")
+    need_ctx = cfg.get("ctx")
+
+    ecu, app, ctx, payload = _split_dlt_header_and_payload(line)
+
+    # 1) If header filters are provided, verify them first
+    if need_ecu is not None:
+        if not _text_match(ecu or "", str(need_ecu), literal=literal, ignore_case=ignore_case, equals=equals):
+            return False
+    if need_app is not None:
+        if not _text_match(app or "", str(need_app), literal=literal, ignore_case=ignore_case, equals=equals):
+            return False
+    if need_ctx is not None:
+        if not _text_match(ctx or "", str(need_ctx), literal=literal, ignore_case=ignore_case, equals=equals):
+            return False
+
+    # 2) Choose haystack
+    hay = payload if payload_only else line
+
+    # 3) Payload (or full-line) pattern match
+    return _text_match(hay, pattern, literal=literal, ignore_case=ignore_case, equals=equals)
+
 
 TRE_JSON_DEBUG = False
 def _dbg(msg: str):
@@ -66,87 +188,246 @@ def _extract_payload_heuristic(line: str) -> str:
     return s
 
 def line_matches(line: str, cfg: dict) -> bool:
+    """
+    Payload-first matcher with robust 'literal + *** wildcard' support.
+
+    Behavior:
+      - If cfg['literal'] == True, the pattern is treated literally except:
+          * '***' is a non-greedy wildcard ('.*?')
+          * spaces are flexible (one or more)
+          * '>>' spacing is flexible ('\\s*>>\\s*')
+      - If cfg['literal'] == False, treat pattern as a normal regex.
+      - Default matching is case-insensitive (can be flipped with ignore_case=False).
+      - If payload_only == True (default), we try to peel payload from the DLT line first.
+      - We sanitize candidates: one physical line, printable only, remove '=CCU2...' tails,
+        collapse whitespace, normalize '>>' spacing.
+    """
+    import re
+
+    # ---- config ----
     if not isinstance(cfg, dict):
         cfg = {"pattern": str(cfg), "literal": True}
 
-    pat = str(cfg.get("pattern", ""))
+    pat         = str(cfg.get("pattern", "")) or ""
     if not pat:
         return False
 
-    literal      = bool(cfg.get("literal", False))
-    equals       = bool(cfg.get("equals", False))
-    ignore_case  = cfg.get("ignore_case", True) is not False
-    norm_ws      = cfg.get("normalize_ws", True) is not False
-    flex_punct   = cfg.get("flex_punct", True)  is not False
-    wildcard     = cfg.get("wildcard", True)    is not False
-    payload_only = cfg.get("payload_only", True) is not False
-    use_anchor   = cfg.get("payload_anchor", True) is not False
+    literal     = bool(cfg.get("literal", False))
+    equals      = bool(cfg.get("equals", False))
+    ignore_case = cfg.get("ignore_case", True) is not False
+    payload_only= cfg.get("payload_only", True) is not False
+    use_anchor  = cfg.get("payload_anchor", True) is not False
 
-    raw = _strip_controls(line)
+    # ---- small local helpers (self-contained; no other deps) ----
+    def _flatten_printable(s: str) -> str:
+        if not s:
+            return ""
+        s = s.replace("\r", " ").replace("\n", " ")
+        # printable ASCII + tabs/spaces
+        s = "".join(ch for ch in s if (32 <= ord(ch) <= 126) or ch in "\t ")
+        return s
 
-    # --- build candidate targets (try in order) ---
-    candidates = []
+    _re_tail_eq_tag = re.compile(r"=\s*[A-Z]{2,10}\d*[a-z]?\b")
 
-    if payload_only:
-        # 1) payload heuristic
-        candidates.append(_extract_payload_heuristic(raw))
-        # 2) anchor slice (from first stable token in pattern)
-        if use_anchor:
-            anc = _best_anchor_from_pattern(pat)
-            if anc:
-                hay = raw if not ignore_case else raw.lower()
-                ned = anc if not ignore_case else anc.lower()
-                pos = hay.find(ned)
-                if pos >= 0:
-                    candidates.append(raw[pos:])
-        # 3) simple colon slice
-        p = raw.find(": ")
-        if 0 < p < 120:
-            candidates.append(raw[p+2:].lstrip())
+    def _sanitize(s: str) -> str:
+        """
+        Normalize a payload for matching/logging:
+          - flatten CR/LF to a single physical line
+          - keep printable ASCII + tabs/spaces
+          - remove known junk tokens (AOTA / TELETELE / CCU2s / CCU2c)
+          - collapse repeated ALLCAPS tokens (e.g., OTAOTA -> OTA)
+          - strip header-like tails (=CCU2x, =ABC123x)
+          - normalize spacing around '>>'
+          - collapse all whitespace to single spaces
+        """
+        if not s:
+            return ""
 
-    # 4) always include whole raw line as last fallback
-    candidates.append(raw)
+        # flatten
+        s = s.replace("\r", " ").replace("\n", " ")
 
-    # prep pattern once
-    pat_s = pat
-    if norm_ws:
-        pat_s = _norm_ws(pat_s)
-    if flex_punct:
-        pat_s = _squash_punct(pat_s)
-    if ignore_case:
-        pat_s = pat_s.lower()
+        # printable only (keep tab/space)
+        s = "".join(ch for ch in s if (32 <= ord(ch) <= 126) or ch in "\t ")
 
-    # literal wildcard -> compile once
-    pat_re = None
-    if literal and wildcard:
-        pat_escaped = re.escape(pat_s).replace(r"\*", ".*")
-        pat_re = re.compile(f"^{pat_escaped}$" if equals else pat_escaped)
+        # known junk tokens
+        for tok in _DENY_TOKENS:
+            s = s.replace(tok, " ")
 
-    for idx, tgt0 in enumerate(candidates, start=1):
-        tgt = tgt0
-        if norm_ws:   tgt = _norm_ws(tgt)
-        if flex_punct: tgt = _squash_punct(tgt)
-        if ignore_case: tgt = tgt.lower()
+        # collapse repeated ALLCAPS (OTAOTA -> OTA)
+        s = re.sub(r"\b([A-Z]{3,10})(?:\1)+\b", r"\1", s)
 
-        if literal:
-            if wildcard and pat_re:
-                ok = pat_re.search(tgt) is not None
-            else:
-                ok = (tgt == pat_s) if equals else (pat_s in tgt)
-        else:
-            flags = re.IGNORECASE if ignore_case else 0
+        # strip tail tags like '=CCU2x'
+        s = _re_tail_eq_tag.sub(" ", s)
+
+        # normalize spacing around >>
+        s = re.sub(r"\s*>>\s*", " >> ", s)
+
+        # collapse whitespace
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+
+    def _extract_payload(line_txt: str) -> str:
+        """
+        Best-effort payload slice from a full DLT row.
+          1) If '[EVALUATION]:' exists, return from there.
+          2) Else take substring after the LAST ']'.
+          3) Else try colon slice (common header: '...: payload').
+          4) Else whole line trimmed.
+        """
+        if not isinstance(line_txt, str):
             try:
-                ok = re.search(pat, tgt, flags) is not None
-            except re.error:
-                ok = (pat_s in tgt)
+                line_txt = line_txt.decode("utf-8", "ignore")
+            except Exception:
+                line_txt = str(line_txt)
 
-        if TRE_JSON_DEBUG:
-            _dbg(f"cand#{idx} ok={ok} | pat='{pat_s}' | tgt='{tgt[:160]}'")
+        # 1) anchor on [EVALUATION]:
+        pos = line_txt.rfind("[EVALUATION]:")
+        if pos != -1:
+            return line_txt[pos:].strip()
+
+        # 2) after last closing bracket (end of args/headers)
+        rbr = line_txt.rfind("]")
+        if rbr != -1 and rbr + 1 < len(line_txt):
+            tail = line_txt[rbr + 1 :].strip()
+            if tail:
+                return tail
+
+        # 3) colon slice (header: '...: payload')
+        p = line_txt.find(": ")
+        if 0 < p < 180:  # keep this conservative
+            tail = line_txt[p + 2 :].lstrip()
+            if tail:
+                return tail
+
+    # 4) fallback
+    return line_txt.strip()
+
+    def sanitize_payload(payload: str) -> str:
+        """Flatten to one printable line, drop known noise, normalize spaces & '>>'."""
+        if not payload:
+            return ""
+        # 1) single physical line
+        s = payload.replace("\r", " ").replace("\n", " ")
+        # 2) printable ASCII + tabs/spaces only
+        s = "".join(ch for ch in s if (32 <= ord(ch) <= 126) or ch in "\t ")
+        # 3) drop known junk tokens
+        for tok in _JUNK_TOKENS:
+            s = s.replace(tok, " ")
+        # 4) collapse repeated ALLCAPS tokens: OTAOTA -> OTA
+        s = _re.sub(r"\b([A-Z]{3,10})(?:\1)+\b", r"\1", s)
+        # 5) strip header-ish tails like '=CCU2x'
+        s = _TAIL_EQ_TAG.sub(" ", s)
+        # 6) normalize '>>' spacing to a single space around it
+        s = _re.sub(r"\s*>>\s*", " >> ", s)
+        # 7) collapse whitespace
+        s = _re.sub(r"\s+", " ", s).strip()
+        return s
+    
+    def _build_candidates(src: str) -> list[str]:
+        raw = _flatten_printable(src)
+        cands: list[str] = []
+        if payload_only:
+            # payload heuristic
+            cands.append(_extract_payload(raw))
+            # anchor slice (from first stable token in pattern)
+            if use_anchor:
+                # take a reasonable anchor: first long-ish word/letter block of pat
+                m = re.search(r"[A-Za-z0-9_]{3,}", pat)
+                if m:
+                    anc = m.group(0)
+                    hay = raw if not ignore_case else raw.lower()
+                    ned = anc if not ignore_case else anc.lower()
+                    pos = hay.find(ned)
+                    if pos >= 0:
+                        cands.append(raw[pos:])
+            # simple colon slice
+            p = raw.find(": ")
+            if 0 < p < 120:
+                cands.append(raw[p + 2 :].lstrip())
+        # always include full raw
+        cands.append(raw)
+        # sanitize all
+        return [_sanitize(x) for x in cands]
+
+    def _literal_to_regex(p: str) -> str:
+        # protect *** tokens
+        token = "___TRE_STARSTARSTAR___"
+        p = p.replace("***", token)
+        # escape everything literally
+        p = re.escape(p)
+        # restore *** as non-greedy wildcard
+        p = p.replace(re.escape(token), r".*?")
+        # flexible spaces
+        p = p.replace(r"\ ", r"\s+")
+        # flexible >> spacing (escaped form '\>\>')
+        p = p.replace(r"\>\>", r"\s*>>\s*")
+        token = "___TRE_STARSTARSTAR___"
+        p = p.replace("***", token)
+
+        # escape everything literally
+        p = re.escape(p)
+
+        # restore *** as non-greedy wildcard
+        p = p.replace(re.escape(token), r".*?")
+
+        # flexible spaces
+        p = p.replace(r"\ ", r"\s+")
+
+        # flexible >> spacing (escaped form '\>\>')
+        p = p.replace(r"\>\>", r"\s*>>\s*")
+        return p
+
+    # ---- prepare pattern ----
+    pat_src = pat
+    flags = re.IGNORECASE if ignore_case else 0
+
+    if literal:
+        rx = _literal_to_regex(pat_src)
+        if equals:
+            rx = f"^{rx}$"
+        try:
+            pat_re = re.compile(rx, flags)
+        except re.error:
+            # fallback to plain substring if compilation fails
+            pat_re = None
+    else:
+        try:
+            pat_re = re.compile(pat_src, flags)
+        except re.error:
+            pat_re = None
+
+    # ---- candidates ----
+    candidates = _build_candidates(line)
+
+    # ---- try all ----
+    for idx, tgt in enumerate(candidates, 1):
+        try:
+            if literal:
+                if pat_re is not None:
+                    ok = pat_re.search(tgt) is not None
+                else:
+                    # substring fallback with flexible spaces (' ' in pat -> \s+ already)
+                    ok = (pat_src.lower() in tgt.lower()) if ignore_case else (pat_src in tgt)
+            else:
+                if pat_re is not None:
+                    ok = pat_re.search(tgt) is not None
+                else:
+                    ok = (pat_src.lower() in tgt.lower()) if ignore_case else (pat_src in tgt)
+        except Exception:
+            ok = False
+
+        if 'TRE_JSON_DEBUG' in globals() and TRE_JSON_DEBUG:
+            try:
+                _dbg(f"cand#{idx} ok={ok} | pat='{pat_src}' | tgt='{tgt[:200]}'")
+            except Exception:
+                pass
 
         if ok:
             return True
 
     return False
+
 
 
 
@@ -424,3 +705,24 @@ def validate_tests_json(path: str) -> Tuple[bool, str]:
                     return False, f"Step {i} ('{t.get('name')}') seq[{j}]: must be string or dict"
 
     return True, f"OK — {len(data)} step(s) validated"
+
+# --- add or replace in TRE_json.py -----------------------------------
+import re as _re
+
+_PAYLOAD_TAIL = _re.compile(r"\]\s*(.*)$")             # after last ']' to end
+_JUNK_TOKENS  = ("TELETELE", "AOTA")
+_TAIL_EQ_TAG  = _re.compile(r"=\s*[A-Z]{2,10}\d*[a-z]?\b")   # =CCU2x, =ABC123 etc.
+
+def parse_dlt(line: str):
+    """
+    Return (ecu, app, ctx, payload) but be liberal in what we accept.
+    If we can't parse headers, return (None, None, None, line).
+    """
+    try:
+        # Common DLT format: ... ECUID APID CTID ... [ARGS] PAYLOAD
+        # We won't over-parse headers here; payload extraction below.
+        payload = extract_payload(line)
+        return (None, None, None, payload)
+    except Exception:
+        return (None, None, None, line)
+
