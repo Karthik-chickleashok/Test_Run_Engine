@@ -1,149 +1,40 @@
-
 #!/usr/bin/env python3
 # TRE_json.py — core checks & report utilities used by TRE_ui.pyw / TRE_online.py
-# Minimal, compatible implementation.
 
 import os, re, json, csv, html, datetime
 from typing import List, Dict, Any, Tuple
 
-# ---------- Matching ----------
-# TRE_json.py
-# --- Add near top imports if not present ---
-import re
-
-# --- Robust DLT line splitter ---
-_DLTCOLON = re.compile(r'::+')  # matches :: or ::: etc.
-
-# tokens we know are noise in the payload stream
-_DENY_TOKENS = {"TELETELE", "AOTA", "CCU2s", "CCU2c"}
-
-# tail fragments like =CCU2x / =ABC123x that sometimes get glued to payloads
-_re_tail_eq_tag = re.compile(r"=\s*[A-Z]{2,10}\d*[a-z]?\b")
-
-def _split_dlt_header_and_payload(line: str):
-    """
-    Try to split a DLT-ish line into (ecu, app, ctx, payload).
-    Heuristics:
-      - Many tools emit 'ECU::APP::CTX: payload...'
-      - Sometimes more fields exist; we take last 3 '::' separated chunks before payload.
-      - If we can't parse, return (None, None, None, original_line).
-    """
-    s = line.strip()
-
-    # If there are '::' separators, try to use them
-    if '::' in s:
-        parts = _DLTCOLON.split(s)
-        # parts = [maybe prefix, ecu, app, ctx, tail...]
-        # Find a plausible payload separator: the last ':' (single) or first space after ctx.
-        # Simple heuristic: take last part as payload; 2-4 previous as ctx/app/ecu if available.
-        if len(parts) >= 4:
-            payload = parts[-1].lstrip(": ").strip()
-            ctx = parts[-2].strip()
-            app = parts[-3].strip()
-            ecu = parts[-4].strip()
-            # Sometimes there are more than 4; we only care about last four
-            return (ecu or None, app or None, ctx or None, payload or "")
-        elif len(parts) == 3:
-            # ecu::app::payload
-            ecu, app, payload = (parts[0].strip() or None,
-                                 parts[1].strip() or None,
-                                 parts[2].lstrip(": ").strip())
-            return (ecu, app, None, payload or "")
-        elif len(parts) == 2:
-            # header::payload
-            header, payload = parts[0].strip(), parts[1].lstrip(": ").strip()
-            return (None, header or None, None, payload or "")
-
-    # Fallback: look for a single colon after some header-ish token
-    if ': ' in s:
-        hdr, payload = s.split(': ', 1)
-        return (None, None, None, payload.strip())
-
-    # As last resort, whole line is "payload"
-    return (None, None, None, s)
-
-def _text_match(hay: str, pat: str, *, literal: bool, ignore_case: bool, equals: bool) -> bool:
-    if ignore_case:
-        hay_cmp = hay.lower()
-        pat_cmp = pat.lower()
-    else:
-        hay_cmp = hay
-        pat_cmp = pat
-
-    if equals:
-        return hay_cmp == pat_cmp
-
-    if literal:
-        return pat_cmp in hay_cmp
-
-    # regex
-    flags = re.IGNORECASE if ignore_case else 0
-    try:
-        return re.search(pat, hay, flags=flags) is not None
-    except re.error:
-        # If pattern is invalid regex, fallback to substring
-        return pat_cmp in hay_cmp
-
-def line_matches(line: str, cfg: dict) -> bool:
-    """
-    cfg keys we honor:
-      - pattern (str)           [required]
-      - literal (bool)          default True for your use-case
-      - ignore_case (bool)      default False
-      - equals (bool)           default False (exact match)
-      - payload_only (bool)     default True in ONLINE (set by TRE_online)
-      - ecu / app / ctx (str)   optional header constraints (respect literal/ignore_case/equals)
-      - min_count (int)         handled by caller (TRE_online)
-    """
-    if not isinstance(cfg, dict):
-        return False
-
-    pattern      = str(cfg.get("pattern", ""))
-    if not pattern:
-        return False
-
-    literal      = bool(cfg.get("literal", True))
-    ignore_case  = bool(cfg.get("ignore_case", False))
-    equals       = bool(cfg.get("equals", False))
-    payload_only = bool(cfg.get("payload_only", False))
-
-    # Header constraints (optional)
-    need_ecu = cfg.get("ecu")
-    need_app = cfg.get("app")
-    need_ctx = cfg.get("ctx")
-
-    ecu, app, ctx, payload = _split_dlt_header_and_payload(line)
-
-    # 1) If header filters are provided, verify them first
-    if need_ecu is not None:
-        if not _text_match(ecu or "", str(need_ecu), literal=literal, ignore_case=ignore_case, equals=equals):
-            return False
-    if need_app is not None:
-        if not _text_match(app or "", str(need_app), literal=literal, ignore_case=ignore_case, equals=equals):
-            return False
-    if need_ctx is not None:
-        if not _text_match(ctx or "", str(need_ctx), literal=literal, ignore_case=ignore_case, equals=equals):
-            return False
-
-    # 2) Choose haystack
-    hay = payload if payload_only else line
-
-    # 3) Payload (or full-line) pattern match
-    return _text_match(hay, pattern, literal=literal, ignore_case=ignore_case, equals=equals)
-
+# =====================
+# Globals / constants
+# =====================
 
 TRE_JSON_DEBUG = False
+
 def _dbg(msg: str):
     if TRE_JSON_DEBUG:
-        try: print("[TRE_JSON]", msg)
-        except Exception: pass
+        try:
+            print("[TRE_JSON]", msg)
+        except Exception:
+            pass
 
+# Known junk tokens that sometimes bleed into payload
+_DENY_TOKENS = {"TELETELE", "AOTA", "CCU2s", "CCU2c"}
+
+# Tail fragments like =CCU2x / =ABC123x that get glued to payloads
+_re_tail_eq_tag = re.compile(r"=\s*[A-Z]{2,10}\d*[a-z]?\b")
+
+# Utility regexes
 _ctrl_rx = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\u200b-\u200f\u202a-\u202e]")
+
+# =====================
+# Generic text helpers
+# =====================
+
 def _strip_controls(s: str) -> str:
     return _ctrl_rx.sub("", s)
 
 def _norm_ws(s: str) -> str:
-    s = s.replace("\t"," ").replace("\u00A0"," ").replace("\u2009"," ")
+    s = s.replace("\t", " ").replace("\u00A0", " ").replace("\u2009", " ")
     return " ".join(s.split())
 
 _punct_class = r"\(\)\[\]\{\}<>\|/\\,:;"
@@ -155,8 +46,9 @@ _rx_tokens   = [
     (re.compile(r"\s*=>\s*"), "=>"),
     (re.compile(r"\s*=\s*"),  "="),
 ]
+
 def _squash_punct(s: str) -> str:
-    s = s.replace("»"," >> ").replace("→","->")
+    s = s.replace("»", " >> ").replace("→", "->")
     s = _rx_punct.sub(r"\1", s)
     for rx, rep in _rx_tokens:
         s = rx.sub(rep, s)
@@ -167,44 +59,95 @@ def _best_anchor_from_pattern(p: str):
     m = _anchor_rx.search(p)
     return m.group(0) if m else None
 
-def _extract_payload_heuristic(line: str) -> str:
-    s = line.lstrip()
-    # quick trims of timestamps/[]/() if present
-    for rx in (
-        re.compile(r"^\[[^\]]*\]\s*"),
-        re.compile(r"^\([^\)]*\)\s*"),
-        re.compile(r"^\d{2,4}[-/]\d{1,2}[-/]\d{1,2}[ T]\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\s*"),
-        re.compile(r"^\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\s*"),
-    ):
-        m = rx.match(s)
-        if m: s = s[m.end():].lstrip()
-    # after first strong sep
-    for sep in (": ", "] ", "} ", "> "):
-        p = s.find(sep)
-        if 0 < p < 80:
-            rest = s[p+len(sep):].lstrip()
-            if re.search(r"[A-Za-z0-9]", rest):
-                s = rest
-                break
-    return s
+# ===========================
+# Payload extraction / parse
+# ===========================
+
+def extract_payload(line_txt: str) -> str:
+    """
+    Best-effort payload slice from a full DLT row.
+      1) If '[EVALUATION]:' exists, return from there.
+      2) Else take substring after the LAST ']'.
+      3) Else try colon slice ('...: payload').
+      4) Else whole line trimmed.
+    """
+    if not isinstance(line_txt, str):
+        try:
+            line_txt = line_txt.decode("utf-8", "ignore")
+        except Exception:
+            line_txt = str(line_txt)
+
+    s = line_txt
+
+    pos = s.rfind("[EVALUATION]:")
+    if pos != -1:
+        return s[pos:].strip()
+
+    rbr = s.rfind("]")
+    if rbr != -1 and rbr + 1 < len(s):
+        tail = s[rbr + 1 :].strip()
+        if tail:
+            return tail
+
+    p = s.find(": ")
+    if 0 < p < 180:
+        tail = s[p + 2 :].lstrip()
+        if tail:
+            return tail
+
+    return s.strip()
+
 
 def sanitize_payload(payload: str) -> str:
-        if not payload:
-            return ""
-        s = payload.replace("\r", " ").replace("\n", " ")
-        s = "".join(ch for ch in s if (32 <= ord(ch) <= 126) or ch in "\t ")
-        for tok in {"TELETELE", "AOTA", "CCU2s", "CCU2c"}:
-            s = s.replace(tok, " ")
-        s = _re.sub(r"\b([A-Z]{3,10})(?:\1)+\b", r"\1", s)          # OTAOTA -> OTA
-        s = _re.sub(r"=\s*[A-Z]{2,10}\d*[a-z]?\b", " ", s)          # strip '=CCU2x'
-        s = _re.sub(r"\s*>>\s*", " >> ", s)                         # normalize >>
-        s = _re.sub(r"\s+", " ", s).strip()                         # squeeze spaces
-        return s
+    """Flatten to one line, strip non-printables, remove junk tails, normalize spacing."""
+    if not payload:
+        return ""
 
-    # keep old names working too
+    # 1) flatten CR/LF
+    s = payload.replace("\r", " ").replace("\n", " ")
+
+    # 2) printable only (keep tab/space)
+    s = "".join(ch for ch in s if (32 <= ord(ch) <= 126) or ch in "\t ")
+
+    # 3) known junk tokens
+    for tok in _DENY_TOKENS:
+        s = s.replace(tok, " ")
+
+    # 4) collapse repeated ALLCAPS (OTAOTA -> OTA)
+    s = re.sub(r"\b([A-Z]{3,10})(?:\1)+\b", r"\1", s)
+
+    # 5) strip tail tags like '=CCU2x'
+    s = _re_tail_eq_tag.sub(" ", s)
+
+    # 6) normalize spacing around >>
+    s = re.sub(r"\s*>>\s*", " >> ", s)
+
+    # 7) collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+# keep old aliases working
 _sanitize = sanitize_payload
 _sanitize_payload = sanitize_payload
-    
+
+
+def parse_dlt(line: str) -> Tuple[str, str, str, str]:
+    """
+    Return (ecu, app, ctx, payload). We do not enforce a strict DLT header parse;
+    instead we reliably provide a payload using extract_payload().
+    If headers are unavailable, ecu/app/ctx are None.
+    """
+    try:
+        # If you later add true header parsing, fill ecu/app/ctx here.
+        payload = extract_payload(line)
+        return (None, None, None, payload)
+    except Exception:
+        return (None, None, None, line.strip())
+
+# =====================
+# Matching
+# =====================
+
 def line_matches(line: str, cfg: dict) -> bool:
     """
     Payload-first matcher with robust 'literal + *** wildcard' support.
@@ -216,13 +159,10 @@ def line_matches(line: str, cfg: dict) -> bool:
           * '>>' spacing is flexible ('\\s*>>\\s*')
       - If cfg['literal'] == False, treat pattern as a normal regex.
       - Default matching is case-insensitive (can be flipped with ignore_case=False).
-      - If payload_only == True (default), we try to peel payload from the DLT line first.
-      - We sanitize candidates: one physical line, printable only, remove '=CCU2...' tails,
+      - If payload_only == True (default for ONLINE), we extract payload and sanitize it.
+      - We sanitize candidates: single physical line, printable only, remove '=CCU2...' tails,
         collapse whitespace, normalize '>>' spacing.
     """
-    import re
-
-    # ---- config ----
     if not isinstance(cfg, dict):
         cfg = {"pattern": str(cfg), "literal": True}
 
@@ -236,108 +176,32 @@ def line_matches(line: str, cfg: dict) -> bool:
     payload_only= cfg.get("payload_only", True) is not False
     use_anchor  = cfg.get("payload_anchor", True) is not False
 
-    # ---- small local helpers (self-contained; no other deps) ----
+    # --- helpers ---
     def _flatten_printable(s: str) -> str:
         if not s:
             return ""
         s = s.replace("\r", " ").replace("\n", " ")
-        # printable ASCII + tabs/spaces
-        s = "".join(ch for ch in s if (32 <= ord(ch) <= 126) or ch in "\t ")
-        return s
+        return "".join(ch for ch in s if (32 <= ord(ch) <= 126) or ch in "\t ")
 
-    _re_tail_eq_tag = re.compile(r"=\s*[A-Z]{2,10}\d*[a-z]?\b")
-
-    def _sanitize(s: str) -> str:
-        """
-        Normalize a payload for matching/logging:
-          - flatten CR/LF to a single physical line
-          - keep printable ASCII + tabs/spaces
-          - remove known junk tokens (AOTA / TELETELE / CCU2s / CCU2c)
-          - collapse repeated ALLCAPS tokens (e.g., OTAOTA -> OTA)
-          - strip header-like tails (=CCU2x, =ABC123x)
-          - normalize spacing around '>>'
-          - collapse all whitespace to single spaces
-        """
+    def _sanitize_local(s: str) -> str:
         if not s:
             return ""
-
-        # flatten
-        s = s.replace("\r", " ").replace("\n", " ")
-
-        # printable only (keep tab/space)
-        s = "".join(ch for ch in s if (32 <= ord(ch) <= 126) or ch in "\t ")
-
-        # known junk tokens
         for tok in _DENY_TOKENS:
             s = s.replace(tok, " ")
-
-        # collapse repeated ALLCAPS (OTAOTA -> OTA)
         s = re.sub(r"\b([A-Z]{3,10})(?:\1)+\b", r"\1", s)
-
-        # strip tail tags like '=CCU2x'
         s = _re_tail_eq_tag.sub(" ", s)
-
-        # normalize spacing around >>
         s = re.sub(r"\s*>>\s*", " >> ", s)
-
-        # collapse whitespace
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
-
-    def _extract_payload(line: str) -> str:
-        """
-        Best-effort payload slice from a full DLT row.
-          1) If '[EVALUATION]:' exists, return from there.
-          2) Else take substring after the LAST ']'.
-          3) Else try colon slice (common header: '...: payload').
-          4) Else whole line trimmed.
-        """
-        if not isinstance(line, str):
-            try:
-                line = line.decode("utf-8", "ignore")
-            except Exception:
-                line = str(line)
-
-        # 1) anchor on [EVALUATION]:
-        pos = line.rfind("[EVALUATION]:")
-        if pos != -1:
-            return line[pos:].strip()
-
-        # 2) after last closing bracket (end of args/headers)
-        rbr = line.rfind("]")
-        if rbr != -1 and rbr + 1 < len(line):
-            tail = line[rbr + 1 :].strip()
-            if tail:
-                return tail
-
-        # 3) colon slice (header: '...: payload')
-        p = line.find(": ")
-        if 0 < p < 180:  # keep this conservative
-            tail = line[p + 2 :].lstrip()
-            if tail:
-                return tail
-
-    # 4) fallback
-    return line.strip()
-
-    # ---- Payload cleaning helpers (public) --------------------------------
-
-
-    # ---- Unified payload sanitizer (simple, robust) ----
-  
-
-
-    
     def _build_candidates(src: str) -> list[str]:
         raw = _flatten_printable(src)
         cands: list[str] = []
         if payload_only:
-            # payload heuristic
-            cands.append(_extract_payload(raw))
-            # anchor slice (from first stable token in pattern)
+            # 1) payload heuristic
+            cands.append(extract_payload(raw))
+            # 2) anchor slice (from first stable token in pattern)
             if use_anchor:
-                # take a reasonable anchor: first long-ish word/letter block of pat
                 m = re.search(r"[A-Za-z0-9_]{3,}", pat)
                 if m:
                     anc = m.group(0)
@@ -346,44 +210,25 @@ def line_matches(line: str, cfg: dict) -> bool:
                     pos = hay.find(ned)
                     if pos >= 0:
                         cands.append(raw[pos:])
-            # simple colon slice
+            # 3) simple colon slice
             p = raw.find(": ")
             if 0 < p < 120:
                 cands.append(raw[p + 2 :].lstrip())
-        # always include full raw
+        # 4) always include full raw
         cands.append(raw)
         # sanitize all
-        return [_sanitize(x) for x in cands]
+        return [_sanitize_local(x) for x in cands]
 
     def _literal_to_regex(p: str) -> str:
-        # protect *** tokens
         token = "___TRE_STARSTARSTAR___"
         p = p.replace("***", token)
-        # escape everything literally
         p = re.escape(p)
-        # restore *** as non-greedy wildcard
         p = p.replace(re.escape(token), r".*?")
-        # flexible spaces
         p = p.replace(r"\ ", r"\s+")
-        # flexible >> spacing (escaped form '\>\>')
-        p = p.replace(r"\>\>", r"\s*>>\s*")
-        token = "___TRE_STARSTARSTAR___"
-        p = p.replace("***", token)
-
-        # escape everything literally
-        p = re.escape(p)
-
-        # restore *** as non-greedy wildcard
-        p = p.replace(re.escape(token), r".*?")
-
-        # flexible spaces
-        p = p.replace(r"\ ", r"\s+")
-
-        # flexible >> spacing (escaped form '\>\>')
         p = p.replace(r"\>\>", r"\s*>>\s*")
         return p
 
-    # ---- prepare pattern ----
+    # --- prepare pattern ---
     pat_src = pat
     flags = re.IGNORECASE if ignore_case else 0
 
@@ -394,7 +239,6 @@ def line_matches(line: str, cfg: dict) -> bool:
         try:
             pat_re = re.compile(rx, flags)
         except re.error:
-            # fallback to plain substring if compilation fails
             pat_re = None
     else:
         try:
@@ -402,17 +246,16 @@ def line_matches(line: str, cfg: dict) -> bool:
         except re.error:
             pat_re = None
 
-    # ---- candidates ----
+    # --- candidates ---
     candidates = _build_candidates(line)
 
-    # ---- try all ----
+    # --- try all ---
     for idx, tgt in enumerate(candidates, 1):
         try:
             if literal:
                 if pat_re is not None:
                     ok = pat_re.search(tgt) is not None
                 else:
-                    # substring fallback with flexible spaces (' ' in pat -> \s+ already)
                     ok = (pat_src.lower() in tgt.lower()) if ignore_case else (pat_src in tgt)
             else:
                 if pat_re is not None:
@@ -422,30 +265,26 @@ def line_matches(line: str, cfg: dict) -> bool:
         except Exception:
             ok = False
 
-        if 'TRE_JSON_DEBUG' in globals() and TRE_JSON_DEBUG:
-            try:
-                _dbg(f"cand#{idx} ok={ok} | pat='{pat_src}' | tgt='{tgt[:200]}'")
-            except Exception:
-                pass
+        if TRE_JSON_DEBUG:
+            _dbg(f"cand#{idx} ok={ok} | pat='{pat_src}' | tgt='{tgt[:200]}'")
 
         if ok:
             return True
 
     return False
 
-
-
-
-
-# ---------- Log reading ----------
+# =====================
+# Log reading
+# =====================
 
 def iter_log(path: str):
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for i, ln in enumerate(f, start=1):
             yield ln.rstrip("\r\n")
 
-
-# ---------- Checkers ----------
+# =====================
+# Checkers
+# =====================
 
 def check_find(lines: List[str], cfg: Dict[str, Any]) -> Dict[str, Any]:
     """ cfg: {pattern, literal?, min_count?} """
@@ -466,7 +305,6 @@ def check_find(lines: List[str], cfg: Dict[str, Any]) -> Dict[str, Any]:
         "detail": {"vc": cfg.get("pattern",""), "count": count, "line": first_line, "index": first_index}
     }
 
-
 def check_not_find(lines: List[str], cfg: Dict[str, Any]) -> Dict[str, Any]:
     """ cfg: {pattern, literal?} """
     for idx, line in enumerate(lines, start=1):
@@ -475,11 +313,7 @@ def check_not_find(lines: List[str], cfg: Dict[str, Any]) -> Dict[str, Any]:
                 "pass": False,
                 "detail": {"vc": cfg.get("pattern",""), "line": line, "index": idx}
             }
-    return {
-        "pass": True,
-        "detail": {"vc": cfg.get("pattern","")}
-    }
-
+    return {"pass": True, "detail": {"vc": cfg.get("pattern","")}}
 
 def _norm_seq_elem(el, default_literal: bool) -> Dict[str, Any]:
     if isinstance(el, dict):
@@ -490,7 +324,6 @@ def _norm_seq_elem(el, default_literal: bool) -> Dict[str, Any]:
             d["literal"] = default_literal
         return d
     return {"pattern": str(el), "literal": default_literal}
-
 
 def check_sequence(lines: List[str], step: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -522,8 +355,9 @@ def check_sequence(lines: List[str], step: Dict[str, Any]) -> Dict[str, Any]:
         "detail": {"vc": " -> ".join(e["pattern"] for e in seq_norm), "seq_idx": pos}
     }
 
-
-# ---------- Runner ----------
+# =====================
+# Runner (offline)
+# =====================
 
 def run_checks(log_path: str, test_path: str) -> Dict[str, Any]:
     lines = list(iter_log(log_path))
@@ -567,8 +401,9 @@ def run_checks(log_path: str, test_path: str) -> Dict[str, Any]:
     summary_pass = not any_fail
     return {"summary_pass": summary_pass, "results": results}
 
-
-# ---------- Report utilities ----------
+# =====================
+# Report utils
+# =====================
 
 def _html_head(title: str) -> str:
     return f"""<!doctype html>
@@ -615,7 +450,6 @@ def to_html(report: Dict[str, Any], path: str, global_preview_limit: int = 200,
             if k in det: detail_items.append(f"{k}: {det[k]}")
         if "line" in det and det["line"] is not None:
             detail_items.append("line:")
-            # never truncate: show full
             detail_items.append(f"<code>{html.escape(det['line'])}</code>")
         if "error" in det:
             detail_items.append(f"error: <code>{html.escape(str(det['error']))}</code>")
@@ -625,7 +459,6 @@ def to_html(report: Dict[str, Any], path: str, global_preview_limit: int = 200,
     out.append(_html_tail())
     with open(path, "w", encoding="utf-8") as f:
         f.write("".join(out))
-
 
 def to_csv(report: Dict[str, Any], path: str, log_name: str = "", test_name: str = ""):
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -648,7 +481,6 @@ def to_csv(report: Dict[str, Any], path: str, log_name: str = "", test_name: str
                 log_name, test_name
             ])
 
-
 def adjust_line_numbers(report: Dict[str, Any], offset: int = 0):
     """If you need to adjust 1-based indices, do it here (kept for compatibility)."""
     try:
@@ -661,8 +493,9 @@ def adjust_line_numbers(report: Dict[str, Any], offset: int = 0):
     except Exception:
         pass
 
-
-# ---------- Validator ----------
+# =====================
+# Validator
+# =====================
 
 def validate_tests_json(path: str) -> Tuple[bool, str]:
     try:
@@ -701,7 +534,6 @@ def validate_tests_json(path: str) -> Tuple[bool, str]:
             seq = t["sequence"]
             if not isinstance(seq, list):
                 return False, f"Step {i} ('{t.get('name')}'): sequence must be a list"
-            # allow strings or dicts with 'pattern'
             for j, el in enumerate(seq, start=1):
                 if isinstance(el, dict):
                     if "pattern" not in el:
@@ -710,23 +542,3 @@ def validate_tests_json(path: str) -> Tuple[bool, str]:
                     return False, f"Step {i} ('{t.get('name')}') seq[{j}]: must be string or dict"
 
     return True, f"OK — {len(data)} step(s) validated"
-
-# --- add or replace in TRE_json.py -----------------------------------
-import re as _re
-
-_PAYLOAD_TAIL = _re.compile(r"\]\s*(.*)$")             # after last ']' to end
-_JUNK_TOKENS  = ("TELETELE", "AOTA")
-_TAIL_EQ_TAG  = _re.compile(r"=\s*[A-Z]{2,10}\d*[a-z]?\b")   # =CCU2x, =ABC123 etc.
-
-def parse_dlt(line: str):
-    """
-    Return (ecu, app, ctx, payload) but be liberal in what we accept.
-    If we can't parse headers, return (None, None, None, line).
-    """
-    try:
-        # Common DLT format: ... ECUID APID CTID ... [ARGS] PAYLOAD
-        # We won't over-parse headers here; payload extraction below.
-        payload = extract_payload(line)
-        return (None, None, None, payload)
-    except Exception:
-        return (None, None, None, line)
